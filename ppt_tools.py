@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import re
 import shutil
+import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -11,7 +13,13 @@ from typing import Iterable
 import comtypes.client
 
 
-ROOT = Path(__file__).resolve().parent
+def app_root() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+ROOT = app_root()
 INPUT_DIR = ROOT / "input"
 OUTPUT_DIR = ROOT / "output"
 PPT_EXTENSIONS = {".ppt", ".pptx", ".pptm", ".pps", ".ppsx", ".pot", ".potx"}
@@ -64,7 +72,11 @@ def powerpoint_app(visible: bool = False):
     try:
         yield app
     finally:
-        app.Quit()
+        try:
+            app.Quit()
+        finally:
+            del app
+            gc.collect()
 
 
 def open_presentation(app, path: Path, read_only: bool = True, with_window: bool = False):

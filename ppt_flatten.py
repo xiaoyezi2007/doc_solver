@@ -21,23 +21,25 @@ MSO_PICTURE = 13
 MSO_LINKED_PICTURE = 11
 
 
-def is_overlay_shape(shape) -> bool:
-    """Return True for video/audio media and animated GIF pictures."""
+def is_video_shape(shape) -> bool:
     try:
-        if shape.Type == MSO_MEDIA:
-            return True
+        return shape.Type == MSO_MEDIA
     except Exception:
-        pass
+        return False
 
+
+def is_gif_shape(shape) -> bool:
     try:
         if shape.Type in (MSO_PICTURE, MSO_LINKED_PICTURE):
             filename = str(shape.Name).lower()
-            if filename.endswith(".gif") or ".gif" in filename:
-                return True
+            return filename.endswith(".gif") or ".gif" in filename
     except Exception:
-        pass
+        return False
 
-    return False
+
+def is_overlay_shape(shape, preserve_video: bool = True, preserve_gif: bool = True) -> bool:
+    """Return True for media that should be copied over the flattened background."""
+    return (preserve_video and is_video_shape(shape)) or (preserve_gif and is_gif_shape(shape))
 
 
 def exported_slide_images(image_dir: Path, expected_count: int) -> list[Path]:
@@ -52,7 +54,14 @@ def exported_slide_images(image_dir: Path, expected_count: int) -> list[Path]:
     return sorted(images, key=slide_number)[:expected_count]
 
 
-def flatten_ppt(ppt_path: Path, output_root: Path, width: int, height: int):
+def flatten_ppt(
+    ppt_path: Path,
+    output_root: Path,
+    width: int,
+    height: int,
+    preserve_video: bool = True,
+    preserve_gif: bool = True,
+):
     name = safe_stem(ppt_path)
     work_dir = output_root / f"{name}_flatten_assets"
     image_dir = work_dir / "slides"
@@ -88,7 +97,7 @@ def flatten_ppt(ppt_path: Path, output_root: Path, width: int, height: int):
                 src_slide = src.Slides(index)
                 for shape_index in range(1, src_slide.Shapes.Count + 1):
                     shape = src_slide.Shapes(shape_index)
-                    if not is_overlay_shape(shape):
+                    if not is_overlay_shape(shape, preserve_video=preserve_video, preserve_gif=preserve_gif):
                         continue
                     try:
                         shape.Copy()
@@ -107,6 +116,8 @@ def flatten_ppt(ppt_path: Path, output_root: Path, width: int, height: int):
         finally:
             dst.Close()
             src.Close()
+            del dst
+            del src
 
     print(f"[OK] {ppt_path.name} -> {flattened_path}")
 

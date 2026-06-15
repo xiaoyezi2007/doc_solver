@@ -13,6 +13,7 @@ def ppt_to_images(ppt_path: Path, output_root: Path, width: int, height: int):
             export_images(deck, target, width=width, height=height)
         finally:
             deck.Close()
+            del deck
     print(f"[OK] {ppt_path.name} -> {target}")
 
 
