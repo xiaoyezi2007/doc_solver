@@ -10,8 +10,8 @@ from datetime import datetime
 from pathlib import Path
 
 import comtypes
-from PySide6.QtCore import QObject, QRunnable, QSize, Qt, QThreadPool, Signal, Slot
-from PySide6.QtGui import QFont, QIcon, QPixmap
+from PySide6.QtCore import QEvent, QObject, QRunnable, QSize, Qt, QThreadPool, Signal, Slot
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -234,8 +234,12 @@ def png_files(path: Path) -> list[Path]:
     return sorted({p.resolve() for p in list(path.glob("*.PNG")) + list(path.glob("*.png"))})
 
 
+PREVIEW_ICON_SIZE = QSize(132, 74)
+PREVIEW_GRID_SIZE = QSize(150, 130)
+
+
 def placeholder_icon(color: str = "#e2e8f0") -> QIcon:
-    pixmap = QPixmap(220, 124)
+    pixmap = QPixmap(PREVIEW_ICON_SIZE)
     pixmap.fill(Qt.transparent)
     pixmap.fill(Qt.GlobalColor.white)
     return QIcon(pixmap)
@@ -247,50 +251,274 @@ class FileQueue(QListWidget):
     def __init__(self, pool: QThreadPool):
         super().__init__()
         self.pool = pool
-        self.setAcceptDrops(True)
-        self.viewport().setAcceptDrops(True)
-        self.setDragEnabled(True)
-        self.setDragDropMode(QAbstractItemView.DragDrop)
-        self.setDragDropOverwriteMode(False)
-        self.setDefaultDropAction(Qt.MoveAction)
+        self.drag_start_pos = None
+        self.drag_start_index = None
+        self.drop_index = None
+        self.dragging_item = False
+        self.dragging_files = False
+        self.setDragEnabled(False)
+        self.setDragDropMode(QAbstractItemView.NoDragDrop)
+        self.setDefaultDropAction(Qt.CopyAction)
         self.setSelectionMode(QAbstractItemView.SingleSelection)
         self.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.setViewMode(QListWidget.IconMode)
         self.setFlow(QListView.LeftToRight)
         self.setWrapping(True)
         self.setResizeMode(QListWidget.Adjust)
-        self.setMovement(QListView.Snap)
-        self.setSpacing(12)
-        self.setIconSize(QSize(220, 124))
-        self.setGridSize(QSize(250, 178))
+        self.setMovement(QListView.Static)
+        self.setSpacing(10)
+        self.setIconSize(PREVIEW_ICON_SIZE)
+        self.setGridSize(PREVIEW_GRID_SIZE)
         self.setWordWrap(True)
-        self.setDropIndicatorShown(True)
-        self.model().rowsMoved.connect(self.files_changed.emit)
+        self.setDropIndicatorShown(False)
+        self.setAcceptDrops(True)
+        self.viewport().setAcceptDrops(True)
+        self.viewport().installEventFilter(self)
+
+    def eventFilter(self, source, event):
+        if source is self.viewport() and event.type() in {
+            QEvent.Type.DragEnter,
+            QEvent.Type.DragMove,
+            QEvent.Type.DragLeave,
+            QEvent.Type.Drop,
+        }:
+            return self.handle_external_drag_event(event, source)
+        return super().eventFilter(source, event)
+
+    def viewportEvent(self, event):
+        if event.type() in {
+            QEvent.Type.DragEnter,
+            QEvent.Type.DragMove,
+            QEvent.Type.DragLeave,
+            QEvent.Type.Drop,
+        }:
+            return self.handle_external_drag_event(event, self.viewport())
+        return super().viewportEvent(event)
+
+    def handle_external_drag_event(self, event, source=None) -> bool:
+        if event.type() == QEvent.Type.DragLeave:
+            self.reset_external_drag_state()
+            event.accept()
+            return True
+
+        paths = self.paths_from_mime(event.mimeData())
+        if not paths:
+            event.ignore()
+            return True
+
+        if event.type() in {QEvent.Type.DragEnter, QEvent.Type.DragMove}:
+            self.dragging_files = True
+            self.drop_index = self.insertion_index_at(self.event_pos_in_viewport(event, source))
+            self.viewport().update()
+            self.accept_file_drag(event)
+            return True
+
+        if event.type() == QEvent.Type.Drop:
+            insertion_index = self.drop_index
+            self.add_paths(paths, insertion_index=insertion_index)
+            self.reset_external_drag_state()
+            self.accept_file_drag(event)
+            return True
+
+        return False
 
     def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
+        if self.paths_from_mime(event.mimeData()):
+            self.dragging_files = True
+            self.drop_index = self.insertion_index_at(self.event_pos(event))
+            self.viewport().update()
+            self.accept_file_drag(event)
         else:
-            super().dragEnterEvent(event)
+            event.ignore()
 
     def dragMoveEvent(self, event):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
+        if self.paths_from_mime(event.mimeData()):
+            self.dragging_files = True
+            self.drop_index = self.insertion_index_at(self.event_pos(event))
+            self.viewport().update()
+            self.accept_file_drag(event)
         else:
-            super().dragMoveEvent(event)
+            event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self.reset_external_drag_state()
+        event.accept()
 
     def dropEvent(self, event):
-        if event.mimeData().hasUrls():
-            paths = [Path(url.toLocalFile()) for url in event.mimeData().urls()]
-            self.add_paths(paths)
-            event.acceptProposedAction()
+        paths = self.paths_from_mime(event.mimeData())
+        if paths:
+            self.add_paths(paths, insertion_index=self.drop_index)
+            self.reset_external_drag_state()
+            self.accept_file_drag(event)
         else:
-            super().dropEvent(event)
-            self.files_changed.emit()
+            event.ignore()
 
-    def add_paths(self, paths: list[Path]):
+    def accept_file_drag(self, event):
+        event.setDropAction(Qt.CopyAction)
+        event.accept()
+
+    def paths_from_mime(self, mime_data) -> list[Path]:
+        paths: list[Path] = []
+        if mime_data.hasUrls():
+            for url in mime_data.urls():
+                local = url.toLocalFile()
+                if local:
+                    paths.append(Path(local))
+
+        if not paths and mime_data.hasText():
+            for line in mime_data.text().splitlines():
+                text = line.strip().strip('"')
+                if text.startswith("file:///"):
+                    text = text.removeprefix("file:///")
+                if text:
+                    paths.append(Path(text))
+
+        return paths
+
+    def event_pos_in_viewport(self, event, source=None):
+        pos = self.event_pos(event)
+        if source is None or source is self.viewport():
+            return pos
+        return self.viewport().mapFromGlobal(source.mapToGlobal(pos))
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            item = self.itemAt(self.event_pos(event))
+            self.drag_start_pos = self.event_pos(event)
+            self.drag_start_index = self.row(item) if item else None
+            self.drop_index = self.drag_start_index
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.drag_start_index is None or not event.buttons() & Qt.LeftButton:
+            super().mouseMoveEvent(event)
+            return
+
+        pos = self.event_pos(event)
+        distance = (pos - self.drag_start_pos).manhattanLength()
+        if distance < QApplication.startDragDistance() and not self.dragging_item:
+            super().mouseMoveEvent(event)
+            return
+
+        self.dragging_item = True
+        self.drop_index = self.insertion_index_at(pos)
+        self.viewport().update()
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if self.dragging_item and event.button() == Qt.LeftButton:
+            self.move_item(self.drag_start_index, self.drop_index)
+            self.reset_drag_state()
+            event.accept()
+            return
+
+        self.reset_drag_state()
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not (self.dragging_item or self.dragging_files) or self.drop_index is None:
+            return
+
+        line = self.insertion_line(self.drop_index)
+        if not line:
+            return
+
+        painter = QPainter(self.viewport())
+        pen = QPen(QColor("#2563eb"), 4)
+        pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(pen)
+        painter.drawLine(line[0], line[1], line[0], line[2])
+
+    def event_pos(self, event):
+        try:
+            return event.position().toPoint()
+        except AttributeError:
+            return event.pos()
+
+    def reset_drag_state(self):
+        self.drag_start_pos = None
+        self.drag_start_index = None
+        self.drop_index = None
+        self.dragging_item = False
+        self.viewport().update()
+
+    def reset_external_drag_state(self):
+        self.drop_index = None
+        self.dragging_files = False
+        self.viewport().update()
+
+    def insertion_index_at(self, pos) -> int:
+        if self.count() == 0:
+            return 0
+
+        best_index = self.count()
+        best_score = float("inf")
+        for index in range(self.count() + 1):
+            line = self.insertion_line(index)
+            if not line:
+                continue
+            x, top, bottom = line
+            center_y = (top + bottom) / 2
+            vertical_penalty = 0 if top <= pos.y() <= bottom else abs(pos.y() - center_y)
+            score = abs(pos.x() - x) + vertical_penalty * 3
+            if score < best_score:
+                best_score = score
+                best_index = index
+        return best_index
+
+    def insertion_line(self, index: int):
+        viewport_width = self.viewport().width()
+        if self.count() == 0:
+            x = max(8, min(viewport_width - 8, self.viewport().width() // 2))
+            return x, 16, min(self.viewport().height() - 16, PREVIEW_GRID_SIZE.height() + 16)
+
+        margin = 6
+        if index <= 0:
+            rect = self.visualItemRect(self.item(0))
+            if not rect.isValid():
+                return None
+            x = max(4, rect.left() - margin)
+            return x, rect.top(), rect.bottom()
+
+        if index >= self.count():
+            rect = self.visualItemRect(self.item(self.count() - 1))
+            if not rect.isValid():
+                return None
+            x = min(viewport_width - 4, rect.right() + margin)
+            return x, rect.top(), rect.bottom()
+
+        previous_rect = self.visualItemRect(self.item(index - 1))
+        next_rect = self.visualItemRect(self.item(index))
+        if not previous_rect.isValid() or not next_rect.isValid():
+            return None
+
+        new_row = abs(previous_rect.top() - next_rect.top()) > previous_rect.height() // 2
+        if new_row:
+            x = min(viewport_width - 4, previous_rect.right() + margin)
+            return x, previous_rect.top(), previous_rect.bottom()
+
+        x = max(4, next_rect.left() - margin)
+        return x, next_rect.top(), next_rect.bottom()
+
+    def move_item(self, old_index: int | None, insertion_index: int | None):
+        if old_index is None or insertion_index is None:
+            return
+        if insertion_index == old_index or insertion_index == old_index + 1:
+            return
+
+        item = self.takeItem(old_index)
+        if insertion_index > old_index:
+            insertion_index -= 1
+        insertion_index = max(0, min(insertion_index, self.count()))
+        self.insertItem(insertion_index, item)
+        self.setCurrentItem(item)
+        self.files_changed.emit()
+
+    def add_paths(self, paths: list[Path], insertion_index: int | None = None):
         existing = {item.data(Qt.UserRole) for item in self.items()}
         added = False
+        insert_at = self.count() if insertion_index is None else max(0, min(insertion_index, self.count()))
         for path in paths:
             if path.is_dir():
                 candidates = sorted(p for p in path.iterdir() if p.suffix.lower() in PPT_EXTENSIONS)
@@ -303,7 +531,8 @@ class FileQueue(QListWidget):
                 item = QListWidgetItem(placeholder_icon(), candidate.name)
                 item.setData(Qt.UserRole, str(candidate))
                 item.setToolTip(str(candidate))
-                self.addItem(item)
+                self.insertItem(insert_at, item)
+                insert_at += 1
                 existing.add(str(candidate))
                 added = True
                 self.load_preview(candidate)
@@ -329,7 +558,7 @@ class FileQueue(QListWidget):
             if item.data(Qt.UserRole) == path_text:
                 pixmap = QPixmap(image_text)
                 if not pixmap.isNull():
-                    item.setIcon(QIcon(pixmap.scaled(220, 124, Qt.KeepAspectRatio, Qt.SmoothTransformation)))
+                    item.setIcon(QIcon(pixmap.scaled(PREVIEW_ICON_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation)))
                 break
 
     def items(self):
@@ -406,6 +635,7 @@ class FeaturePage(QWidget):
         self.feature = feature
         self.pool = pool
         self.running = False
+        self.external_drop_targets = []
         self.build()
 
     def build(self):
@@ -428,16 +658,19 @@ class FeaturePage(QWidget):
 
         left = QFrame()
         left.setObjectName("panel")
+        self.register_external_drop_target(left)
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(16, 16, 16, 16)
         left_layout.setSpacing(12)
         hint = QLabel("拖入 PPT 文件，或拖动下方小框改变处理顺序。")
         hint.setObjectName("fieldHelp")
+        self.register_external_drop_target(hint)
         self.queue = FileQueue(self.pool)
         add_button = QPushButton("+")
         add_button.setObjectName("addButton")
         add_button.setToolTip("添加文件")
         add_button.clicked.connect(self.choose_files)
+        self.register_external_drop_target(add_button)
         left_layout.addWidget(hint)
         left_layout.addWidget(self.queue, 1)
         left_layout.addWidget(add_button)
@@ -462,6 +695,21 @@ class FeaturePage(QWidget):
         self.log.setReadOnly(True)
         self.log.setMaximumHeight(150)
         root.addWidget(self.log)
+
+    def register_external_drop_target(self, widget):
+        widget.setAcceptDrops(True)
+        widget.installEventFilter(self)
+        self.external_drop_targets.append(widget)
+
+    def eventFilter(self, source, event):
+        if source in self.external_drop_targets and event.type() in {
+            QEvent.Type.DragEnter,
+            QEvent.Type.DragMove,
+            QEvent.Type.DragLeave,
+            QEvent.Type.Drop,
+        }:
+            return self.queue.handle_external_drag_event(event, source)
+        return super().eventFilter(source, event)
 
     def build_options(self, layout: QVBoxLayout):
         layout.addWidget(section_title("输出路径"))

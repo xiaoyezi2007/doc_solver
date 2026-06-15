@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 from pathlib import Path
 
 from ppt_tools import (
@@ -43,7 +44,7 @@ def is_overlay_shape(shape, preserve_video: bool = True, preserve_gif: bool = Tr
 
 
 def exported_slide_images(image_dir: Path, expected_count: int) -> list[Path]:
-    images = list(image_dir.glob("*.PNG")) + list(image_dir.glob("*.png"))
+    images = list({path.resolve() for path in list(image_dir.glob("*.PNG")) + list(image_dir.glob("*.png"))})
     if len(images) < expected_count:
         raise RuntimeError(f"Expected {expected_count} exported slide images, found {len(images)} in {image_dir}")
 
@@ -51,7 +52,12 @@ def exported_slide_images(image_dir: Path, expected_count: int) -> list[Path]:
         match = re.search(r"(\d+)(?=\.png$)", path.name, re.IGNORECASE)
         return int(match.group(1)) if match else 0
 
-    return sorted(images, key=slide_number)[:expected_count]
+    return sorted(images, key=lambda path: (slide_number(path), path.name.lower()))[:expected_count]
+
+
+def delete_all_slides(deck):
+    for index in range(deck.Slides.Count, 0, -1):
+        deck.Slides(index).Delete()
 
 
 def flatten_ppt(
@@ -76,12 +82,13 @@ def flatten_ppt(
         try:
             dst.PageSetup.SlideWidth = src.PageSetup.SlideWidth
             dst.PageSetup.SlideHeight = src.PageSetup.SlideHeight
+            delete_all_slides(dst)
 
             export_images(src, image_dir, width=width, height=height)
             image_paths = exported_slide_images(image_dir, src.Slides.Count)
 
             for index in range(1, src.Slides.Count + 1):
-                slide = dst.Slides.Add(index, PP_LAYOUT_BLANK)
+                slide = dst.Slides.Add(dst.Slides.Count + 1, PP_LAYOUT_BLANK)
                 image_path = image_paths[index - 1]
 
                 slide.Shapes.AddPicture(
@@ -118,6 +125,7 @@ def flatten_ppt(
             src.Close()
             del dst
             del src
+            shutil.rmtree(work_dir, ignore_errors=True)
 
     print(f"[OK] {ppt_path.name} -> {flattened_path}")
 
